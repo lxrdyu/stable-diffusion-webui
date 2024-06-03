@@ -1,63 +1,101 @@
-import sys, os, shlex
+import sys
 import contextlib
+from functools import lru_cache
+
 import torch
-from modules import errors
-from packaging import version
+from modules import errors, shared, npu_specific
+
+if sys.platform == "darwin":
+    from modules import mac_specific
+
+if shared.cmd_opts.use_ipex:
+    from modules import xpu_specific
 
 
-# has_mps is only available in nightly pytorch (for now) and macOS 12.3+.
-# check `getattr` and try it for compatibility
+def has_xpu() -> bool:
+    return shared.cmd_opts.use_ipex and xpu_specific.has_xpu
+
+
 def has_mps() -> bool:
-    if not getattr(torch, 'has_mps', False):
+    if sys.platform != "darwin":
         return False
-    try:
-        torch.zeros(1).to(torch.device("mps"))
-        return True
-    except Exception:
-        return False
+    else:
+        return mac_specific.has_mps
 
 
-def extract_device_id(args, name):
-    for x in range(len(args)):
-        if name in args[x]:
-            return args[x + 1]
+def cuda_no_autocast(device_id=None) -> bool:
+    if device_id is None:
+        device_id = get_cuda_device_id()
+    return (
+        torch.cuda.get_device_capability(device_id) == (7, 5)
+        and torch.cuda.get_device_name(device_id).startswith("NVIDIA GeForce GTX 16")
+    )
 
-    return None
+
+def get_cuda_device_id():
+    return (
+        int(shared.cmd_opts.device_id)
+        if shared.cmd_opts.device_id is not None and shared.cmd_opts.device_id.isdigit()
+        else 0
+    ) or torch.cuda.current_device()
 
 
 def get_cuda_device_string():
-    from modules import shared
-
     if shared.cmd_opts.device_id is not None:
         return f"cuda:{shared.cmd_opts.device_id}"
 
     return "cuda"
 
 
-def get_optimal_device():
+def get_optimal_device_name():
     if torch.cuda.is_available():
-        return torch.device(get_cuda_device_string())
+        return get_cuda_device_string()
 
     if has_mps():
-        return torch.device("mps")
+        return "mps"
 
-    return cpu
+    if has_xpu():
+        return xpu_specific.get_xpu_device_string()
+
+    if npu_specific.has_npu:
+        return npu_specific.get_npu_device_string()
+
+    return "cpu"
+
+
+def get_optimal_device():
+    return torch.device(get_optimal_device_name())
 
 
 def get_device_for(task):
-    from modules import shared
-
-    if task in shared.cmd_opts.use_cpu:
+    if task in shared.cmd_opts.use_cpu or "all" in shared.cmd_opts.use_cpu:
         return cpu
 
     return get_optimal_device()
 
 
 def torch_gc():
+
     if torch.cuda.is_available():
         with torch.cuda.device(get_cuda_device_string()):
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
+
+    if has_mps():
+        mac_specific.torch_mps_gc()
+
+    if has_xpu():
+        xpu_specific.torch_xpu_gc()
+
+    if npu_specific.has_npu:
+        torch_npu_set_device()
+        npu_specific.torch_npu_gc()
+
+
+def torch_npu_set_device():
+    # Work around due to bug in torch_npu, revert me after fixed, @see https://gitee.com/ascend/pytorch/issues/I8KECW?from=project-issue
+    if npu_specific.has_npu:
+        torch.npu.set_device(0)
 
 
 def enable_tf32():
@@ -65,45 +103,126 @@ def enable_tf32():
 
         # enabling benchmark option seems to enable a range of cards to do fp16 when they otherwise can't
         # see https://github.com/AUTOMATIC1111/stable-diffusion-webui/pull/4407
-        if any([torch.cuda.get_device_capability(devid) == (7, 5) for devid in range(0, torch.cuda.device_count())]):
+        if cuda_no_autocast():
             torch.backends.cudnn.benchmark = True
 
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
 
-
 errors.run(enable_tf32, "Enabling TF32")
 
-cpu = torch.device("cpu")
-device = device_interrogate = device_gfpgan = device_esrgan = device_codeformer = None
-dtype = torch.float16
-dtype_vae = torch.float16
+cpu: torch.device = torch.device("cpu")
+fp8: bool = False
+device: torch.device = None
+device_interrogate: torch.device = None
+device_gfpgan: torch.device = None
+device_esrgan: torch.device = None
+device_codeformer: torch.device = None
+dtype: torch.dtype = torch.float16
+dtype_vae: torch.dtype = torch.float16
+dtype_unet: torch.dtype = torch.float16
+dtype_inference: torch.dtype = torch.float16
+unet_needs_upcast = False
 
 
-def randn(seed, shape):
-    torch.manual_seed(seed)
-    if device.type == 'mps':
-        return torch.randn(shape, device=cpu).to(device)
-    return torch.randn(shape, device=device)
+def cond_cast_unet(input):
+    return input.to(dtype_unet) if unet_needs_upcast else input
 
 
-def randn_without_seed(shape):
-    if device.type == 'mps':
-        return torch.randn(shape, device=cpu).to(device)
-    return torch.randn(shape, device=device)
+def cond_cast_float(input):
+    return input.float() if unet_needs_upcast else input
+
+
+nv_rng = None
+patch_module_list = [
+    torch.nn.Linear,
+    torch.nn.Conv2d,
+    torch.nn.MultiheadAttention,
+    torch.nn.GroupNorm,
+    torch.nn.LayerNorm,
+]
+
+
+def manual_cast_forward(target_dtype):
+    def forward_wrapper(self, *args, **kwargs):
+        if any(
+            isinstance(arg, torch.Tensor) and arg.dtype != target_dtype
+            for arg in args
+        ):
+            args = [arg.to(target_dtype) if isinstance(arg, torch.Tensor) else arg for arg in args]
+            kwargs = {k: v.to(target_dtype) if isinstance(v, torch.Tensor) else v for k, v in kwargs.items()}
+
+        org_dtype = target_dtype
+        for param in self.parameters():
+            if param.dtype != target_dtype:
+                org_dtype = param.dtype
+                break
+
+        if org_dtype != target_dtype:
+            self.to(target_dtype)
+        result = self.org_forward(*args, **kwargs)
+        if org_dtype != target_dtype:
+            self.to(org_dtype)
+
+        if target_dtype != dtype_inference:
+            if isinstance(result, tuple):
+                result = tuple(
+                    i.to(dtype_inference)
+                    if isinstance(i, torch.Tensor)
+                    else i
+                    for i in result
+                )
+            elif isinstance(result, torch.Tensor):
+                result = result.to(dtype_inference)
+        return result
+    return forward_wrapper
+
+
+@contextlib.contextmanager
+def manual_cast(target_dtype):
+    applied = False
+    for module_type in patch_module_list:
+        if hasattr(module_type, "org_forward"):
+            continue
+        applied = True
+        org_forward = module_type.forward
+        if module_type == torch.nn.MultiheadAttention:
+            module_type.forward = manual_cast_forward(torch.float32)
+        else:
+            module_type.forward = manual_cast_forward(target_dtype)
+        module_type.org_forward = org_forward
+    try:
+        yield None
+    finally:
+        if applied:
+            for module_type in patch_module_list:
+                if hasattr(module_type, "org_forward"):
+                    module_type.forward = module_type.org_forward
+                    delattr(module_type, "org_forward")
 
 
 def autocast(disable=False):
-    from modules import shared
-
     if disable:
         return contextlib.nullcontext()
 
-    if dtype == torch.float32 or shared.cmd_opts.precision == "full":
+    if fp8 and device==cpu:
+        return torch.autocast("cpu", dtype=torch.bfloat16, enabled=True)
+
+    if fp8 and dtype_inference == torch.float32:
+        return manual_cast(dtype)
+
+    if dtype == torch.float32 or dtype_inference == torch.float32:
         return contextlib.nullcontext()
 
+    if has_xpu() or has_mps() or cuda_no_autocast():
+        return manual_cast(dtype)
+
     return torch.autocast("cuda")
+
+
+def without_autocast(disable=False):
+    return torch.autocast("cuda", enabled=False) if torch.is_autocast_enabled() and not disable else contextlib.nullcontext()
 
 
 class NansException(Exception):
@@ -111,8 +230,6 @@ class NansException(Exception):
 
 
 def test_for_nans(x, where):
-    from modules import shared
-
     if shared.cmd_opts.disable_nan_check:
         return
 
@@ -123,7 +240,7 @@ def test_for_nans(x, where):
         message = "A tensor with all NaNs was produced in Unet."
 
         if not shared.cmd_opts.no_half:
-            message += " This could be either because there's not enough precision to represent the picture, or because your video card does not support half type. Try using --no-half commandline argument to fix this."
+            message += " This could be either because there's not enough precision to represent the picture, or because your video card does not support half type. Try setting the \"Upcast cross attention layer to float32\" option in Settings > Stable Diffusion or using the --no-half commandline argument to fix this."
 
     elif where == "vae":
         message = "A tensor with all NaNs was produced in VAE."
@@ -133,60 +250,22 @@ def test_for_nans(x, where):
     else:
         message = "A tensor with all NaNs was produced."
 
+    message += " Use --disable-nan-check commandline argument to disable this check."
+
     raise NansException(message)
 
 
-# MPS workaround for https://github.com/pytorch/pytorch/issues/79383
-orig_tensor_to = torch.Tensor.to
-def tensor_to_fix(self, *args, **kwargs):
-    if self.device.type != 'mps' and \
-       ((len(args) > 0 and isinstance(args[0], torch.device) and args[0].type == 'mps') or \
-       (isinstance(kwargs.get('device'), torch.device) and kwargs['device'].type == 'mps')):
-        self = self.contiguous()
-    return orig_tensor_to(self, *args, **kwargs)
+@lru_cache
+def first_time_calculation():
+    """
+    just do any calculation with pytorch layers - the first time this is done it allocaltes about 700MB of memory and
+    spends about 2.7 seconds doing that, at least with NVidia.
+    """
 
+    x = torch.zeros((1, 1)).to(device, dtype)
+    linear = torch.nn.Linear(1, 1).to(device, dtype)
+    linear(x)
 
-# MPS workaround for https://github.com/pytorch/pytorch/issues/80800 
-orig_layer_norm = torch.nn.functional.layer_norm
-def layer_norm_fix(*args, **kwargs):
-    if len(args) > 0 and isinstance(args[0], torch.Tensor) and args[0].device.type == 'mps':
-        args = list(args)
-        args[0] = args[0].contiguous()
-    return orig_layer_norm(*args, **kwargs)
-
-
-# MPS workaround for https://github.com/pytorch/pytorch/issues/90532
-orig_tensor_numpy = torch.Tensor.numpy
-def numpy_fix(self, *args, **kwargs):
-    if self.requires_grad:
-        self = self.detach()
-    return orig_tensor_numpy(self, *args, **kwargs)
-
-
-# MPS workaround for https://github.com/pytorch/pytorch/issues/89784
-orig_cumsum = torch.cumsum
-orig_Tensor_cumsum = torch.Tensor.cumsum
-def cumsum_fix(input, cumsum_func, *args, **kwargs):
-    if input.device.type == 'mps':
-        output_dtype = kwargs.get('dtype', input.dtype)
-        if output_dtype == torch.int64:
-            return cumsum_func(input.cpu(), *args, **kwargs).to(input.device)
-        elif cumsum_needs_bool_fix and output_dtype == torch.bool or cumsum_needs_int_fix and (output_dtype == torch.int8 or output_dtype == torch.int16):
-            return cumsum_func(input.to(torch.int32), *args, **kwargs).to(torch.int64)
-    return cumsum_func(input, *args, **kwargs)
-
-
-if has_mps():
-    if version.parse(torch.__version__) < version.parse("1.13"):
-        # PyTorch 1.13 doesn't need these fixes but unfortunately is slower and has regressions that prevent training from working
-        torch.Tensor.to = tensor_to_fix
-        torch.nn.functional.layer_norm = layer_norm_fix
-        torch.Tensor.numpy = numpy_fix
-    elif version.parse(torch.__version__) > version.parse("1.13.1"):
-        cumsum_needs_int_fix = not torch.Tensor([1,2]).to(torch.device("mps")).equal(torch.ShortTensor([1,1]).to(torch.device("mps")).cumsum(0))
-        cumsum_needs_bool_fix = not torch.BoolTensor([True,True]).to(device=torch.device("mps"), dtype=torch.int64).equal(torch.BoolTensor([True,False]).to(torch.device("mps")).cumsum(0))
-        torch.cumsum = lambda input, *args, **kwargs: ( cumsum_fix(input, orig_cumsum, *args, **kwargs) )
-        torch.Tensor.cumsum = lambda self, *args, **kwargs: ( cumsum_fix(self, orig_Tensor_cumsum, *args, **kwargs) )
-        orig_narrow = torch.narrow
-        torch.narrow = lambda *args, **kwargs: ( orig_narrow(*args, **kwargs).clone() )
-
+    x = torch.zeros((1, 1, 3, 3)).to(device, dtype)
+    conv2d = torch.nn.Conv2d(1, 1, (3, 3)).to(device, dtype)
+    conv2d(x)
